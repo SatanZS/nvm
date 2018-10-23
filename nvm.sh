@@ -48,7 +48,7 @@ nvm_command_info() {
   local INFO
   COMMAND="${1}"
   if type "${COMMAND}" | nvm_grep -q hashed; then
-    INFO="$(type "${COMMAND}" | command sed -E 's/\(|)//g' | command awk '{print $4}')"
+    INFO="$(type "${COMMAND}" | command sed -E 's/\(|\)//g' | command awk '{print $4}')"
   elif type "${COMMAND}" | nvm_grep -q aliased; then
     INFO="$(which "${COMMAND}") ($(type "${COMMAND}" | command awk '{ $1=$2=$3=$4="" ;print }' | command sed -e 's/^\ *//g' -Ee "s/\`|'//g" ))"
   elif type "${COMMAND}" | nvm_grep -q "^${COMMAND} is an alias for"; then
@@ -86,7 +86,7 @@ nvm_get_latest() {
     fi
     NVM_LATEST_URL="$(curl ${CURL_COMPRESSED_FLAG:-} -q -w "%{url_effective}\\n" -L -s -S http://latest.nvm.sh -o /dev/null)"
   elif nvm_has "wget"; then
-    NVM_LATEST_URL="$(wget http://latest.nvm.sh --server-response -O /dev/null 2>&1 | command awk '/^  Location: /{DEST=$2} END{ print DEST }')"
+    NVM_LATEST_URL="$(wget -q http://latest.nvm.sh --server-response -O /dev/null 2>&1 | command awk '/^  Location: /{DEST=$2} END{ print DEST }')"
   else
     nvm_err 'nvm needs curl or wget to proceed.'
     return 1
@@ -113,6 +113,7 @@ nvm_download() {
                             -e 's/-L //' \
                             -e 's/-I /--server-response /' \
                             -e 's/-s /-q /' \
+                            -e 's/-sS /-nv /' \
                             -e 's/-o /-O /' \
                             -e 's/-C - /-c /')
     # shellcheck disable=SC2086
@@ -129,7 +130,7 @@ nvm_has_system_iojs() {
 }
 
 nvm_is_version_installed() {
-  [ -n "${1-}" ] && [ -d "$(nvm_version_path "${1-}" 2> /dev/null)" ]
+  [ -n "${1-}" ] && [ -x "$(nvm_version_path "$1" 2> /dev/null)"/bin/node ]
 }
 
 nvm_print_npm_version() {
@@ -206,15 +207,29 @@ nvm_install_latest_npm() {
       NVM_IS_4_4_OR_BELOW=1
     fi
 
+    local NVM_IS_5_OR_ABOVE
+    NVM_IS_5_OR_ABOVE=0
+    if [ $NVM_IS_4_4_OR_BELOW -eq 0 ] && nvm_version_greater_than_or_equal_to "${NODE_VERSION}" 5.0.0; then
+      NVM_IS_5_OR_ABOVE=1
+    fi
+
+    local NVM_IS_6_OR_ABOVE
+    NVM_IS_6_OR_ABOVE=0
+    if [ $NVM_IS_5_OR_ABOVE -eq 1 ] && nvm_version_greater_than_or_equal_to "${NODE_VERSION}" 6.0.0; then
+      NVM_IS_6_OR_ABOVE=1
+    fi
+
     if [ $NVM_IS_4_4_OR_BELOW -eq 1 ] || (\
-      nvm_version_greater_than_or_equal_to "${NODE_VERSION}" 5.0.0 \
-      && nvm_version_greater 5.10.0 "${NODE_VERSION}"\
+      [ $NVM_IS_5_OR_ABOVE -eq 1 ] && nvm_version_greater 5.10.0 "${NODE_VERSION}"\
     ); then
       nvm_echo '* `npm` `v5.3.x` is the last version that works on `node` 4.x versions below v4.4, or 5.x versions below v5.10, due to `Buffer.alloc`'
       $NVM_NPM_CMD install -g npm@5.3
     elif [ $NVM_IS_4_4_OR_BELOW -eq 0 ] && nvm_version_greater 4.7.0 "${NODE_VERSION}"; then
-      nvm_echo '* `npm` `v5.4.x` is the last version that works on `node` `v4.5` and `v4.6`'
-      $NVM_NPM_CMD install -g npm@5.4
+      nvm_echo '* `npm` `v5.4.1` is the last version that works on `node` `v4.5` and `v4.6`'
+      $NVM_NPM_CMD install -g npm@5.4.1
+    elif [ $NVM_IS_6_OR_ABOVE -eq 0 ]; then
+      nvm_echo '* `npm` `v5.x` is the last version that works on `node` below `v6.0.0`'
+      $NVM_NPM_CMD install -g npm@5
     else
       nvm_echo '* Installing latest `npm`; if this does not work on your node version, please report a bug!'
       $NVM_NPM_CMD install -g npm
@@ -243,6 +258,15 @@ if [ -z "${NVM_DIR-}" ]; then
   # shellcheck disable=SC1001
   NVM_DIR="$(nvm_cd ${NVM_CD_FLAGS} "$(dirname "${NVM_SCRIPT_SOURCE:-$0}")" > /dev/null && \pwd)"
   export NVM_DIR
+else
+  # https://unix.stackexchange.com/a/198289
+  case $NVM_DIR in
+    *[!/]*/)
+      NVM_DIR="${NVM_DIR%"${NVM_DIR##*[!/]}"}"
+      export NVM_DIR
+      nvm_err "Warning: \$NVM_DIR should not have trailing slashes"
+    ;;
+  esac
 fi
 unset NVM_SCRIPT_SOURCE 2> /dev/null
 
@@ -293,7 +317,7 @@ nvm_rc_version() {
     nvm_err "No .nvmrc file found"
     return 1
   fi
-  read -r NVM_RC_VERSION < "${NVMRC_PATH}" || command printf ''
+  NVM_RC_VERSION="$(command head -n 1 "${NVMRC_PATH}" | command tr -d '\r')" || command printf ''
   if [ ! -n "${NVM_RC_VERSION}" ]; then
     nvm_err "Warning: empty .nvmrc file found at \"${NVMRC_PATH}\""
     return 2
@@ -509,9 +533,9 @@ nvm_remote_versions() {
   NVM_LS_REMOTE_IOJS_EXIT_CODE=0
   local NVM_LS_REMOTE_IOJS_OUTPUT
   NVM_LS_REMOTE_IOJS_OUTPUT=''
-  if [ -z "${NVM_LTS-}" ] && ( \
-    [ -z "${NVM_FLAVOR-}" ] || [ "${NVM_FLAVOR-}" = "${NVM_IOJS_PREFIX}" ] \
-  ); then
+  if [ -z "${NVM_LTS-}" ] && {
+    [ -z "${NVM_FLAVOR-}" ] || [ "${NVM_FLAVOR-}" = "${NVM_IOJS_PREFIX}" ];
+  }; then
     NVM_LS_REMOTE_IOJS_OUTPUT=$(nvm_ls_remote_iojs "${PATTERN-}") &&:
     NVM_LS_REMOTE_IOJS_EXIT_CODE=$?
   fi
@@ -614,12 +638,19 @@ nvm_change_path() {
   elif ! nvm_echo "${1-}" | nvm_grep -q "${NVM_DIR}/[^/]*${2-}" \
     && ! nvm_echo "${1-}" | nvm_grep -q "${NVM_DIR}/versions/[^/]*/[^/]*${2-}"; then
     nvm_echo "${3-}${2-}:${1-}"
+  # if the initial path contains BOTH an nvm path (checked for above) and
+  # that nvm path is preceded by a system binary path, just prepend the
+  # supplementary path instead of replacing it.
+  # https://github.com/creationix/nvm/issues/1652#issuecomment-342571223
+  elif nvm_echo "${1-}" | nvm_grep -Eq "(^|:)(/usr(/local)?)?${2-}:.*${NVM_DIR}/[^/]*${2-}" \
+    || nvm_echo "${1-}" | nvm_grep -Eq "(^|:)(/usr(/local)?)?${2-}:.*${NVM_DIR}/versions/[^/]*/[^/]*${2-}"; then
+    nvm_echo "${3-}${2-}:${1-}"
   # use sed to replace the existing nvm path with the supplementary path. This
   # preserves the order of the path.
   else
     nvm_echo "${1-}" | command sed \
-      -e "s#${NVM_DIR}/[^/]*${2-}[^:]*#${3-}${2-}#g" \
-      -e "s#${NVM_DIR}/versions/[^/]*/[^/]*${2-}[^:]*#${3-}${2-}#g"
+      -e "s#${NVM_DIR}/[^/]*${2-}[^:]*#${3-}${2-}#" \
+      -e "s#${NVM_DIR}/versions/[^/]*/[^/]*${2-}[^:]*#${3-}${2-}#"
   fi
 }
 
@@ -747,25 +778,42 @@ nvm_list_aliases() {
   NVM_ALIAS_DIR="$(nvm_alias_path)"
   command mkdir -p "${NVM_ALIAS_DIR}/lts"
 
-  local ALIAS_PATH
-  for ALIAS_PATH in "${NVM_ALIAS_DIR}/${ALIAS}"*; do
-    NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}"
-  done
+  (
+    local ALIAS_PATH
+    for ALIAS_PATH in "${NVM_ALIAS_DIR}/${ALIAS}"*; do
+      NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}" &
+    done
+    wait
+  ) | sort
 
-  local ALIAS_NAME
-  for ALIAS_NAME in "$(nvm_node_prefix)" "stable" "unstable" "$(nvm_iojs_prefix)"; do
-    if [ ! -f "${NVM_ALIAS_DIR}/${ALIAS_NAME}" ] && ([ -z "${ALIAS}" ] || [ "${ALIAS_NAME}" = "${ALIAS}" ]); then
+  (
+    local ALIAS_NAME
+    for ALIAS_NAME in "$(nvm_node_prefix)" "stable" "unstable"; do
+      {
+        if [ ! -f "${NVM_ALIAS_DIR}/${ALIAS_NAME}" ] && { [ -z "${ALIAS}" ] || [ "${ALIAS_NAME}" = "${ALIAS}" ]; }; then
+          NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_default_alias "${ALIAS_NAME}"
+        fi
+      } &
+    done
+    wait
+    ALIAS_NAME="$(nvm_iojs_prefix)"
+    if [ ! -f "${NVM_ALIAS_DIR}/${ALIAS_NAME}" ] && { [ -z "${ALIAS}" ] || [ "${ALIAS_NAME}" = "${ALIAS}" ]; }; then
       NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_default_alias "${ALIAS_NAME}"
     fi
-  done
+  ) | sort
 
-  local LTS_ALIAS
-  for ALIAS_PATH in "${NVM_ALIAS_DIR}/lts/${ALIAS}"*; do
-    LTS_ALIAS="$(NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_LTS=true nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}")"
-    if [ -n "${LTS_ALIAS}" ]; then
-      nvm_echo "${LTS_ALIAS}"
-    fi
-  done
+  (
+    local LTS_ALIAS
+    for ALIAS_PATH in "${NVM_ALIAS_DIR}/lts/${ALIAS}"*; do
+      {
+        LTS_ALIAS="$(NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_LTS=true nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}")"
+        if [ -n "${LTS_ALIAS}" ]; then
+          nvm_echo "${LTS_ALIAS}"
+        fi
+      } &
+    done
+    wait
+  ) | sort
   return
 }
 
@@ -1066,7 +1114,13 @@ nvm_ls_remote() {
   local PATTERN
   PATTERN="${1-}"
   if nvm_validate_implicit_alias "${PATTERN}" 2> /dev/null ; then
-    PATTERN="$(NVM_LTS="${NVM_LTS-}" nvm_ls_remote "$(nvm_print_implicit_alias remote "${PATTERN}")" | command tail -1 | command awk '{ print $1 }')"
+    local IMPLICIT
+    IMPLICIT="$(nvm_print_implicit_alias remote "${PATTERN}")"
+    if [ -z "${IMPLICIT-}" ] || [ "${IMPLICIT}" = 'N/A' ]; then
+      nvm_echo "N/A"
+      return 3
+    fi
+    PATTERN="$(NVM_LTS="${NVM_LTS-}" nvm_ls_remote "${IMPLICIT}" | command tail -1 | command awk '{ print $1 }')"
   elif [ -n "${PATTERN}" ]; then
     PATTERN="$(nvm_ensure_version_prefix "${PATTERN}")"
   else
@@ -1171,8 +1225,7 @@ nvm_ls_remote_index_tab() {
       nvm_make_alias "$LTS_ALIAS" "$LTS_VERSION" >/dev/null 2>&1
     done
 
-  VERSIONS="$(nvm_echo "${VERSION_LIST}" \
-    | command awk -v pattern="${PATTERN-}" -v lts="${LTS-}" '{
+  VERSIONS="$({ command awk -v pattern="${PATTERN-}" -v lts="${LTS-}" '{
         if (!$1) { next }
         if (pattern && tolower($1) !~ tolower(pattern)) { next }
         if (lts == "*" && $10 ~ /^\-?$/) { next }
@@ -1180,7 +1233,10 @@ nvm_ls_remote_index_tab() {
         if ($10 !~ /^\-?$/) print $1, $10; else print $1
       }' \
     | nvm_grep -w "${PATTERN:-.*}" \
-    | $SORT_COMMAND)"
+    | $SORT_COMMAND; } << EOF
+$VERSION_LIST
+EOF
+)"
   if [ "$ZSH_HAS_SHWORDSPLIT_UNSET" -eq 1 ] && nvm_has "unsetopt"; then
     unsetopt shwordsplit
   fi
@@ -1549,7 +1605,7 @@ nvm_print_implicit_alias() {
   if [ "_$2" = '_stable' ]; then
     nvm_echo "${STABLE}"
   elif [ "_$2" = '_unstable' ]; then
-    nvm_echo "${UNSTABLE}"
+    nvm_echo "${UNSTABLE:-"N/A"}"
   fi
 }
 
@@ -1698,12 +1754,19 @@ nvm_install_binary() {
   local TMPDIR
   local VERSION_PATH
 
+  local PROGRESS_BAR
   local NODE_OR_IOJS
   if [ "${FLAVOR}" = 'node' ]; then
     NODE_OR_IOJS="${FLAVOR}"
   fi
+  if [ "${NVM_NO_PROGRESS-}" = "1" ]; then
+    # --silent, --show-error, use short option as @samrocketman mentions the compatibility issue.
+    PROGRESS_BAR="-sS"
+  else
+    PROGRESS_BAR="--progress-bar"
+  fi
   nvm_echo "Downloading and installing ${NODE_OR_IOJS-} ${VERSION}..."
-  TARBALL="$(nvm_download_artifact "${FLAVOR}" binary "${TYPE-}" "${VERSION}" | command tail -1)"
+  TARBALL="$(PROGRESS_BAR="${PROGRESS_BAR}" nvm_download_artifact "${FLAVOR}" binary "${TYPE-}" "${VERSION}" | command tail -1)"
   if [ -f "${TARBALL}" ]; then
     TMPDIR="$(dirname "${TARBALL}")/files"
   fi
@@ -1860,7 +1923,7 @@ nvm_download_artifact() {
     command rm -rf "${TARBALL}"
   fi
   nvm_err "Downloading ${TARBALL_URL}..."
-  nvm_download -L -C - --progress-bar "${TARBALL_URL}" -o "${TARBALL}" || (
+  nvm_download -L -C - "${PROGRESS_BAR}" "${TARBALL_URL}" -o "${TARBALL}" || (
     command rm -rf "${TARBALL}" "${tmpdir}"
     nvm_err "Binary download from ${TARBALL_URL} failed, trying source."
     return 4
@@ -2007,7 +2070,21 @@ nvm_install_source() {
   local TMPDIR
   local VERSION_PATH
 
-  TARBALL="$(nvm_download_artifact "${FLAVOR}" source "${TYPE}" "${VERSION}" | command tail -1)" && \
+  if [ "${NVM_NO_PROGRESS-}" = "1" ]; then
+    # --silent, --show-error, use short option as @samrocketman mentions the compatibility issue.
+    PROGRESS_BAR="-sS"
+  else
+    PROGRESS_BAR="--progress-bar"
+  fi
+
+  local ZSH_HAS_SHWORDSPLIT_UNSET
+  ZSH_HAS_SHWORDSPLIT_UNSET=1
+  if nvm_has "setopt"; then
+    ZSH_HAS_SHWORDSPLIT_UNSET="$(set +e ; setopt | nvm_grep -q shwordsplit ; nvm_echo $?)"
+    setopt shwordsplit
+  fi
+
+  TARBALL="$(PROGRESS_BAR="${PROGRESS_BAR}" nvm_download_artifact "${FLAVOR}" source "${TYPE}" "${VERSION}" | command tail -1)" && \
   [ -f "${TARBALL}" ] && \
   TMPDIR="$(dirname "${TARBALL}")/files" && \
   if ! (
@@ -2022,9 +2099,15 @@ nvm_install_source() {
     command rm -f "${VERSION_PATH}" 2>/dev/null && \
     $make -j "${NVM_MAKE_JOBS}" ${MAKE_CXX-} install
   ); then
+    if [ "$ZSH_HAS_SHWORDSPLIT_UNSET" -eq 1 ] && nvm_has "unsetopt"; then
+      unsetopt shwordsplit
+    fi
     nvm_err "nvm: install ${VERSION} failed!"
     command rm -rf "${TMPDIR-}"
     return 1
+  fi
+  if [ "$ZSH_HAS_SHWORDSPLIT_UNSET" -eq 1 ] && nvm_has "unsetopt"; then
+    unsetopt shwordsplit
   fi
 }
 
@@ -2176,7 +2259,7 @@ iojs_version_has_solaris_binary() {
 # Succeeds if $NODE_VERSION represents a node version that has a
 # Solaris binary, fails otherwise.
 # Currently, node versions starting from v0.8.6 have a Solaris binary
-# avaliable.
+# available.
 node_version_has_solaris_binary() {
   local NODE_VERSION
   NODE_VERSION="$1"
@@ -2240,7 +2323,7 @@ nvm_check_file_permissions() {
     ZSH_HAS_NONOMATCH_UNSET="$(set +e ; setopt | nvm_grep -q nonomatch ; nvm_echo $?)"
     setopt nonomatch
   fi
-  for FILE in $1/* $1/.[!.]* $1/..?* ; do
+  for FILE in "$1"/* "$1"/.[!.]* "$1"/..?* ; do
     if [ -d "$FILE" ]; then
       if ! nvm_check_file_permissions "$FILE"; then
         if [ "${ZSH_HAS_NONOMATCH_UNSET}" -eq 1 ] && nvm_has "setopt"; then
@@ -2313,6 +2396,7 @@ nvm() {
       nvm_echo '    --lts=<LTS name>                        When installing, only select from versions for a specific LTS line'
       nvm_echo '    --skip-default-packages                 When installing, skip the default-packages file if it exists'
       nvm_echo '    --latest-npm                            After installing, attempt to upgrade to the latest working npm on the given node version'
+      nvm_echo '    --no-progress                           Disable the progress bar on any downloads'
       nvm_echo '  nvm uninstall <version>                   Uninstall a version'
       nvm_echo '  nvm uninstall --lts                       Uninstall using automatic LTS (long-term support) alias `lts/*`, if available.'
       nvm_echo '  nvm uninstall --lts=<LTS name>            Uninstall using automatic alias for provided LTS line, if available.'
@@ -2383,6 +2467,7 @@ nvm() {
 
     "debug" )
       local ZSH_HAS_SHWORDSPLIT_UNSET
+      local OS_VERSION
       ZSH_HAS_SHWORDSPLIT_UNSET=1
       if nvm_has "setopt"; then
         ZSH_HAS_SHWORDSPLIT_UNSET="$(set +e ; setopt | nvm_grep -q shwordsplit ; nvm_echo $?)"
@@ -2405,9 +2490,16 @@ nvm() {
       nvm_err "shell version: '$(${SHELL} --version | command head -n 1)'"
       nvm_err "uname -a: '$(command uname -a | command awk '{$2=""; print}' | command xargs)'"
       if [ "$(nvm_get_os)" = "darwin" ] && nvm_has sw_vers; then
-        nvm_err "OS version: $(sw_vers | command awk '{print $2}' | command xargs)"
+        OS_VERSION="$(sw_vers | command awk '{print $2}' | command xargs)"
       elif [ -r "/etc/issue" ]; then
-        nvm_err "OS version: $(command head -n 1 /etc/issue | command sed 's/\\.//g')"
+        OS_VERSION="$(command head -n 1 /etc/issue | command sed 's/\\.//g')"
+        if [ -z "${OS_VERSION}" ] && [ -r "/etc/os-release" ] ; then
+          # shellcheck disable=SC1091
+          OS_VERSION="$(. /etc/os-release && echo "${NAME}" "${VERSION}")"
+        fi
+      fi
+      if [ -n "${OS_VERSION}" ]; then
+        nvm_err "OS version: ${OS_VERSION}"
       fi
       if nvm_has "curl"; then
         nvm_err "curl: $(nvm_command_info curl), $(command curl -V | command head -n 1)"
@@ -2456,7 +2548,9 @@ nvm() {
       fi
 
       local nobinary
+      local noprogress
       nobinary=0
+      noprogress=0
       local LTS
       local NVM_UPGRADE_NPM
       NVM_UPGRADE_NPM=0
@@ -2471,6 +2565,10 @@ nvm() {
             shift # consume "-j"
             nvm_get_make_jobs "$1"
             shift # consume job count
+          ;;
+          --no-progress)
+            noprogress=1
+            shift
           ;;
           --lts)
             LTS='*'
@@ -2558,7 +2656,15 @@ nvm() {
         case "$1" in
           --reinstall-packages-from=*)
             PROVIDED_REINSTALL_PACKAGES_FROM="$(nvm_echo "$1" | command cut -c 27-)"
+            if [ -z "${PROVIDED_REINSTALL_PACKAGES_FROM}" ]; then
+              nvm_err 'If --reinstall-packages-from is provided, it must point to an installed version of node.'
+              return 6
+            fi
             REINSTALL_PACKAGES_FROM="$(nvm_version "$PROVIDED_REINSTALL_PACKAGES_FROM")" ||:
+          ;;
+          --reinstall-packages-from)
+            nvm_err 'If --reinstall-packages-from is provided, it must point to an installed version of node using `=`.'
+            return 6
           ;;
           --copy-packages-from=*)
             PROVIDED_REINSTALL_PACKAGES_FROM="$(nvm_echo "$1" | command cut -c 22-)"
@@ -2589,7 +2695,7 @@ nvm() {
           # Fail on lines that have multiple space-separated words
           case ${line} in
             *\ * )
-              nvm_err "Only one package per line is allowed in the ${NVM_DIR}/default-packages file. Please remove any lines with multiple space-seperated values."
+              nvm_err "Only one package per line is allowed in the ${NVM_DIR}/default-packages file. Please remove any lines with multiple space-separated values."
               return 1
             ;;
           esac
@@ -2627,6 +2733,7 @@ nvm() {
           fi
         fi
         if [ -n "${LTS-}" ]; then
+          LTS="$(echo "${LTS}" | tr '[:upper:]' '[:lower:]')"
           nvm_ensure_default_set "lts/${LTS}"
         else
           nvm_ensure_default_set "$provided_version"
@@ -2671,7 +2778,7 @@ nvm() {
 
         # skip binary install if "nobinary" option specified.
         if [ $nobinary -ne 1 ] && nvm_binary_available "$VERSION"; then
-          nvm_install_binary "${FLAVOR}" std "${VERSION}"
+          NVM_NO_PROGRESS="${NVM_NO_PROGRESS:-${noprogress}}" nvm_install_binary "${FLAVOR}" std "${VERSION}"
           EXIT_CODE=$?
         fi
         if [ "$EXIT_CODE" -ne 0 ]; then
@@ -2679,7 +2786,7 @@ nvm() {
             nvm_get_make_jobs
           fi
 
-          nvm_install_source "${FLAVOR}" std "${VERSION}" "${NVM_MAKE_JOBS}" "${ADDITIONAL_PARAMETERS}"
+          NVM_NO_PROGRESS="${NVM_NO_PROGRESS:-${noprogress}}" nvm_install_source "${FLAVOR}" std "${VERSION}" "${NVM_MAKE_JOBS}" "${ADDITIONAL_PARAMETERS}"
           EXIT_CODE=$?
         fi
 
@@ -3404,7 +3511,7 @@ nvm() {
       NVM_VERSION_ONLY=true NVM_LTS="${NVM_LTS-}" nvm_remote_version "${PATTERN:-node}"
     ;;
     "--version" )
-      nvm_echo '0.33.8'
+      nvm_echo '0.33.11'
     ;;
     "unload" )
       nvm deactivate >/dev/null 2>&1
@@ -3506,6 +3613,8 @@ nvm_supports_xz() {
 }
 
 nvm_auto() {
+  local NVM_CURRENT
+  NVM_CURRENT="$(nvm_ls_current)"
   local NVM_MODE
   NVM_MODE="${1-}"
   local VERSION
@@ -3517,11 +3626,15 @@ nvm_auto() {
       nvm install >/dev/null
     fi
   elif [ "_$NVM_MODE" = '_use' ]; then
-    VERSION="$(nvm_resolve_local_alias default 2>/dev/null || nvm_echo)"
-    if [ -n "$VERSION" ]; then
-      nvm use --silent "$VERSION" >/dev/null
-    elif nvm_rc_version >/dev/null 2>&1; then
-      nvm use --silent >/dev/null
+    if [ "_${NVM_CURRENT}" = '_none' ] || [ "_${NVM_CURRENT}" = '_system' ]; then
+      VERSION="$(nvm_resolve_local_alias default 2>/dev/null || nvm_echo)"
+      if [ -n "${VERSION}" ]; then
+        nvm use --silent "${VERSION}" >/dev/null
+      elif nvm_rc_version >/dev/null 2>&1; then
+        nvm use --silent >/dev/null
+      fi
+    else
+      nvm use --silent "${NVM_CURRENT}" >/dev/null
     fi
   elif [ "_$NVM_MODE" != '_none' ]; then
     nvm_err 'Invalid auto mode supplied.'
